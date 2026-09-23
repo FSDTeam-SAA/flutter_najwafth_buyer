@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
@@ -9,6 +10,7 @@ import '../../../core/network/network_providers.dart';
 import '../../../core/notifications/push_notification_service.dart';
 import '../../../core/storage/key_value_storage.dart';
 import '../../../core/storage/storage_providers.dart';
+import '../data/apple_sign_in_service.dart';
 
 final authControllerProvider = NotifierProvider<AuthController, AuthState>(
   AuthController.new,
@@ -36,18 +38,22 @@ final class AuthState {
   });
 
   factory AuthState.initial(KeyValueStorage storage) {
+    final accessToken = storage.readString(_AuthStorageKeys.accessToken);
+    final refreshToken = storage.readString(_AuthStorageKeys.refreshToken);
     return AuthState(
       onboardingCompleted:
           storage.readBool(_AuthStorageKeys.onboarding) ?? false,
       isAuthenticated:
-          storage.readBool(_AuthStorageKeys.isAuthenticated) ?? false,
+          (storage.readBool(_AuthStorageKeys.isAuthenticated) ?? false) &&
+          (accessToken?.isNotEmpty ?? false) &&
+          (refreshToken?.isNotEmpty ?? false),
       fullName: storage.readString(_AuthStorageKeys.fullName) ?? '',
       email: storage.readString(_AuthStorageKeys.email) ?? '',
       phone: storage.readString(_AuthStorageKeys.phone) ?? '',
       password: storage.readString(_AuthStorageKeys.password) ?? '',
       rememberMe: storage.readBool(_AuthStorageKeys.rememberMe) ?? false,
-      accessToken: storage.readString(_AuthStorageKeys.accessToken),
-      refreshToken: storage.readString(_AuthStorageKeys.refreshToken),
+      accessToken: accessToken,
+      refreshToken: refreshToken,
       userId: storage.readString(_AuthStorageKeys.userId),
       role: storage.readString(_AuthStorageKeys.role),
       pendingResetEmail: storage.readString(_AuthStorageKeys.pendingResetEmail),
@@ -150,7 +156,8 @@ final class AuthController extends Notifier<AuthState> {
 
     final initial = AuthState.initial(_storage!);
 
-    if (initial.isAuthenticated && initial.role != _appRole) {
+    if (initial.isAuthenticated &&
+        (initial.role != _appRole || !_hasUnexpiredJwt(initial.refreshToken))) {
       Future<void>.microtask(_clearSession);
 
       final sanitized = initial.copyWith(
@@ -158,7 +165,7 @@ final class AuthController extends Notifier<AuthState> {
         clearTokens: true,
       );
 
-      _log('init:sanitized-non-buyer-session', sanitized);
+      _log('init:sanitized-invalid-session', sanitized);
       return sanitized;
     }
 
@@ -241,6 +248,75 @@ final class AuthController extends Notifier<AuthState> {
     unawaited(ref.read(pushNotificationServiceProvider).start());
 
     _log('signIn:done', state);
+  }
+
+  Future<void> signInWithApple() async {
+    _logStep('signInWithApple:start');
+    AppleIdentity identity;
+    try {
+      identity = await ref.read(appleSignInServiceProvider).signIn();
+    } on AppleSignInException {
+      rethrow;
+    } on Object {
+      throw const AppleSignInException('Apple sign-in could not be completed.');
+    }
+
+    try {
+      final result = await ref
+          .read(apiClientProvider)
+          .post<Map<String, dynamic>>(
+            '/auth/social-login',
+            data: {
+              'idToken': identity.idToken,
+              'provider': 'apple.com',
+              if (identity.name?.trim().isNotEmpty ?? false)
+                'name': identity.name!.trim(),
+            },
+            parser: _extractDataMap,
+          );
+      final data = _unwrap(result);
+      final accessToken = (data['accessToken'] ?? '').toString();
+      final refreshToken = (data['refreshToken'] ?? '').toString();
+      final user = data['user'];
+      final userMap = user is Map<String, dynamic> ? user : <String, dynamic>{};
+      final role = (data['role'] ?? userMap['role'] ?? '').toString();
+      final userId = (data['_id'] ?? userMap['_id'] ?? '').toString();
+
+      if (accessToken.isEmpty || refreshToken.isEmpty) {
+        throw const AuthFlowException(
+          'Authentication failed. Please try again.',
+        );
+      }
+      if (role.isNotEmpty && role != _appRole) {
+        throw const AuthFlowException(
+          'This account is not authorized for the buyer application.',
+        );
+      }
+
+      state = state.copyWith(
+        isAuthenticated: true,
+        rememberMe: true,
+        onboardingCompleted: true,
+        email: (userMap['email'] ?? '').toString(),
+        fullName:
+            (userMap['name'] ?? userMap['fullName'] ?? identity.name ?? '')
+                .toString(),
+        phone: (userMap['phone'] ?? '').toString(),
+        password: '',
+        accessToken: accessToken,
+        refreshToken: refreshToken,
+        userId: userId.isEmpty ? null : userId,
+        role: role.isEmpty ? null : role,
+      );
+
+      await _storage!.remove(_AuthStorageKeys.password);
+      await _persistSession(rememberMe: true);
+      unawaited(ref.read(pushNotificationServiceProvider).start());
+      _log('signInWithApple:done', state);
+    } on Object {
+      await ref.read(appleSignInServiceProvider).signOut();
+      rethrow;
+    }
   }
 
   Future<void> signUp({
@@ -451,27 +527,71 @@ final class AuthController extends Notifier<AuthState> {
 
   Future<void> logout() async {
     _logStep('logout:start');
-
-    // Drop this device's push token while we still hold a valid session.
     try {
-      await ref.read(pushNotificationServiceProvider).unregister();
-    } catch (e) {
-      _logStep('logout:push-unregister-failed $e');
+      // Drop this device's push token while we still hold a valid session.
+      try {
+        await ref.read(pushNotificationServiceProvider).unregister();
+      } catch (e) {
+        _logStep('logout:push-unregister-failed $e');
+      }
+
+      if (state.accessToken != null && state.accessToken!.isNotEmpty) {
+        await ref
+            .read(apiClientProvider)
+            .post<dynamic>(
+              '/auth/logout',
+              options: Options(
+                headers: {'Authorization': 'Bearer ${state.accessToken!}'},
+              ),
+            );
+      }
+    } catch (error) {
+      _logStep('logout:remote-failed $error');
+    } finally {
+      try {
+        await ref.read(appleSignInServiceProvider).signOut();
+      } on Object catch (error) {
+        _logStep('logout:apple-sign-out-failed $error');
+      }
+      await _clearSession();
+      _log('logout:done', state);
+    }
+  }
+
+  Future<void> deleteAccount() async {
+    final token = state.accessToken;
+    if (!state.isAuthenticated || token == null || token.isEmpty) {
+      throw const AuthFlowException('Please sign in again.');
     }
 
-    if (state.accessToken != null && state.accessToken!.isNotEmpty) {
-      await ref
-          .read(apiClientProvider)
-          .post<dynamic>(
-            '/auth/logout',
-            options: Options(
-              headers: {'Authorization': 'Bearer ${state.accessToken!}'},
-            ),
-          );
+    final result = await ref
+        .read(apiClientProvider)
+        .delete<Map<String, dynamic>>(
+          '/user/account',
+          options: Options(headers: {'Authorization': 'Bearer $token'}),
+          parser: (raw) {
+            if (raw is! Map<String, dynamic>) {
+              throw const AuthFlowException('Unexpected server response.');
+            }
+            if (raw['success'] != true) {
+              throw AuthFlowException(
+                (raw['message'] ?? 'Account deletion failed.').toString(),
+              );
+            }
+            return raw;
+          },
+        );
+    _unwrap(result);
+
+    try {
+      await ref.read(appleSignInServiceProvider).signOut();
+    } on Object catch (error) {
+      _logStep('deleteAccount:apple-sign-out-failed $error');
     }
 
-    await _clearSession();
-    _log('logout:done', state);
+    // Remove saved credentials, personal details, and app preferences together.
+    await _storage!.clear();
+    state = AuthState.initial(_storage!);
   }
 
   Future<void> expireSession() async {
@@ -566,6 +686,26 @@ final class AuthController extends Notifier<AuthState> {
         'otpRequestedAt:${s.otpRequestedAt}, '
         'otpVerified:${s.otpVerified}, '
         'hasVerifiedResetOtp:${(s.verifiedResetOtp ?? '').isNotEmpty}}';
+  }
+}
+
+bool _hasUnexpiredJwt(String? token) {
+  if (token == null) return false;
+  try {
+    final parts = token.split('.');
+    if (parts.length != 3) return false;
+    final payload = jsonDecode(
+      utf8.decode(base64Url.decode(base64Url.normalize(parts[1]))),
+    );
+    if (payload is! Map<String, dynamic>) return false;
+    final expiry = payload['exp'];
+    return expiry is num &&
+        DateTime.fromMillisecondsSinceEpoch(
+          expiry.toInt() * 1000,
+          isUtc: true,
+        ).isAfter(DateTime.now().toUtc());
+  } on Object {
+    return false;
   }
 }
 
